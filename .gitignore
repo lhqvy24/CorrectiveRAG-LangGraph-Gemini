@@ -1,4 +1,17 @@
+# Skip macOS system files
+.DS_Store
+
+# Skip Environment Variables
 .env
+
+# Skip Virtual Environments
+venv/
+.venv/
+
+# Skip Cache of Python
 __pycache__/
 *.pyc
-venv/
+
+# Skip Database Vector (Build artifact)
+vectorstore/
+chroma_db/
