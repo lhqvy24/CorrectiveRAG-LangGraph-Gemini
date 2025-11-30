@@ -7,13 +7,13 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 # --- LangChain / LangGraph imports ---
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableConfig
+from langchain_huggingface import HuggingFaceEmbeddings
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -30,7 +30,7 @@ GEMINI_API_KEY = os.getenv("gg_api_key")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found. Please set it in .env")
 
-# Khởi tạo Global LLM và Embedder (Hiệu suất cao hơn)
+# Initialize Global LLM and Embedder
 def get_llm(model: str = "gemini-2.5-flash") -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
         model=model,
@@ -39,8 +39,12 @@ def get_llm(model: str = "gemini-2.5-flash") -> ChatGoogleGenerativeAI:
     )
 
 LLM = get_llm()
-EMBEDDER = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-MAX_ATTEMPTS = 2 # Giới hạn số lần thử lại tối đa (1 initial + 1 retry)
+EMBEDDER = HuggingFaceEmbeddings(
+    model_name="maidalun1020/bce-embedding-base_v1",
+    model_kwargs={'device': 'cpu'}, # Or 'cuda' / 'mps' if there is a GPU
+    encode_kwargs={'normalize_embeddings': True} # BCE suggests normalize
+)
+MAX_ATTEMPTS = 2 # Limit retry time (1 initial + 1 retry)
 
 
 # ========== 1. DOCS → VECTOR STORE (HTML SUPPORTED) ==========
@@ -61,9 +65,9 @@ URL_MAP = {
 def load_docs() -> List[Document]:
     """Load docs (.html/.htm/.md/.txt), convert HTML → text, split, add metadata."""
     if not DOCS_DIR.exists():
-        raise FileNotFoundError("docs/langgraph/ not found. Please put your 6 docs there.")
+        raise FileNotFoundError("docs/langgraph/ not found. Please put your docs there.")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200) # Overlap rate about 10-25% is good
     docs: List[Document] = []
 
     for f in DOCS_DIR.glob("*"):
@@ -75,16 +79,30 @@ def load_docs() -> List[Document]:
 
         if f.suffix.lower() in [".html", ".htm"]:
             soup = BeautifulSoup(raw, "html.parser")
-            # Cải tiến: Chỉ lấy text trong thẻ body để loại bỏ header/footer không liên quan
+            # Only keep text in body tag to ignore header/footer that's not relevant
             text = soup.body.get_text(separator="\n") if soup.body else soup.get_text(separator="\n")
         else:
             text = raw
 
         chunks = splitter.split_text(text)
         
-        # Logic trích xuất metadata
-        first_line = text.splitlines()[0] if text.splitlines() else f.stem
-        section_title = first_line.strip().lstrip("# ").strip() or f.stem
+        # --- Metadata Extraction Logic ---
+        section_title = f.stem # Default to filename first
+        
+        # Try to extract real title from HTML
+        if f.suffix.lower() in [".html", ".htm"]:
+            soup = BeautifulSoup(raw, "html.parser")
+            if soup.title and soup.title.string:
+                section_title = soup.title.string.strip()
+            elif soup.find("h1"):
+                section_title = soup.find("h1").get_text().strip()
+        else:
+            # For text/md files, try first line
+            if text.splitlines():
+                possible_title = text.splitlines()[0].strip().lstrip("# ").strip()
+                if possible_title:
+                    section_title = possible_title
+
         source_url = URL_MAP.get(f.stem, f.name)
 
         for chunk in chunks:
@@ -108,7 +126,7 @@ def build_vectorstore():
 
     Chroma.from_documents(
         docs,
-        embedding=EMBEDDER, # SỬ DỤNG GLOBAL EMBEDDER
+        embedding=EMBEDDER,
         persist_directory=VS_DIR,
     )
     print(f"Vector store built at {VS_DIR}")
@@ -116,13 +134,12 @@ def build_vectorstore():
 
 def get_retriever(stronger: bool = False):
     """Load Chroma store and return retriever."""
-    # SỬ DỤNG GLOBAL EMBEDDER
     vs = Chroma(
         persist_directory=VS_DIR,
         embedding_function=EMBEDDER
     )
     k = 4 if not stronger else 8
-    # Cài đặt bộ tìm kiếm với k chunks
+    # Setting search tool with k chunks
     return vs.as_retriever(search_kwargs={"k": k})
 
 
@@ -146,11 +163,11 @@ def format_docs(docs: List[Document]) -> str:
     return "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
 
 def extract_citations(docs: List[Document]) -> List[Dict[str, str]]:
-    # Lọc các trích dẫn độc nhất (unique citations)
+    # Filter unique citations based on source_url
     unique_cits = {}
     for d in docs:
         url = d.metadata.get("source_url", "unknown")
-        # Sử dụng URL làm khóa để đảm bảo chỉ lấy 1 lần cho mỗi nguồn
+        # Use URL as key to ensure only take one for each source
         unique_cits[url] = {
             "source_url": url,
             "section_title": d.metadata.get("section_title", "unknown"),
@@ -159,7 +176,7 @@ def extract_citations(docs: List[Document]) -> List[Dict[str, str]]:
 
 
 def rag_answer(question: str, stronger: bool = False):
-    # Sử dụng LLM và Retriever đã được khởi tạo
+    # Use initialized LLM and Retriever
     retriever = get_retriever(stronger)
 
     docs = retriever.invoke(question)
@@ -170,13 +187,12 @@ def rag_answer(question: str, stronger: bool = False):
     answer_text = resp.content if isinstance(resp.content, str) else str(resp.content)
     citations = extract_citations(docs)
 
-    return answer_text, citations
+    return answer_text, citations, context
 
 
-def llm_judge(question: str, answer: str, citations: List[Dict[str, str]]) -> Dict[str, Any]:
-    # Sử dụng LLM đã khởi tạo
-    
-    # Cải tiến: Yêu cầu cú pháp JSON mạnh mẽ hơn
+def llm_judge(question: str, answer: str, citations: List[Dict[str, str]], context: str):
+    # Use initialized LLM  
+    # Request stronger JSON syntax
     judge_prompt = f"""
 You are a strict judge for a Corrective RAG system.
 
@@ -188,7 +204,11 @@ Given:
 Judge the answer on its sufficiency, grounding, and relevance.
 Your response MUST be a single, valid JSON object with the following schema:
 {{"pass": boolean, "reasons": string, "score": integer}}
-The "pass" field is TRUE only if the answer is complete, well-grounded by the citations, and directly addresses the question. Otherwise, it is FALSE.
+
+RULES FOR JUDGING:
+1. If the answer is complete, accurate, and grounded in the citations -> PASS = TRUE.
+2. If the answer says "I don't know", "I am not sure", or "The context does not contain info" -> PASS = FALSE (Score: 1). We want the system to retry searching.
+3. If the answer is irrelevant or hallucinates -> PASS = FALSE.
 
 Question:
 {question}
@@ -196,15 +216,18 @@ Question:
 Draft answer:
 {answer}
 
+Source Context used for answer:
+{context}
+
 Citations:
 {json.dumps(citations, indent=2)}
 
-Return ONLY JSON. Do not add any conversational text or markdown code blocks (e.g., ```json).
+Return ONLY JSON. Do not add any conversational text.
 """
     resp = LLM.invoke(judge_prompt)
     raw = resp.content.strip()
 
-    # Cải tiến: Xử lý lỗi JSON parsing (loại bỏ các ký tự Markdown không cần thiết)
+    # Cải tiến: Xử lý lỗi JSON parsing
     if raw.startswith("```json"):
         raw = raw.strip("`").strip("json").strip()
     elif raw.startswith("```"):
@@ -216,7 +239,6 @@ Return ONLY JSON. Do not add any conversational text or markdown code blocks (e.
         print(f"ERROR: Could not parse judge JSON. Fallback to FAIL. Error: {e}")
         verdict = {"pass": False, "reasons": f"Failed to parse judge output: {raw[:50]}...", "score": 1}
 
-    # Đảm bảo các trường cần thiết tồn tại
     verdict.setdefault("pass", False)
     verdict.setdefault("reasons", "No reasons provided.")
     verdict.setdefault("score", 2)
@@ -225,7 +247,6 @@ Return ONLY JSON. Do not add any conversational text or markdown code blocks (e.
 
 def llm_rewrite(original_question: str, reasons: str) -> str:
     # Sử dụng LLM đã khởi tạo
-
     rewrite_prompt = f"""
 Rewrite this question to be clearer and specifically address the missing information or error.
 Focus on creating a better search query to retrieve relevant documents.
@@ -238,7 +259,6 @@ The answer failed because of these issues:
 
 Return ONLY the single, rewritten question text.
 """
-
     resp = LLM.invoke(rewrite_prompt)
     return resp.content.strip()
 
@@ -278,6 +298,7 @@ class RAGState(TypedDict):
     question: str
     draft_answers: List[str]
     citations: List[List[Dict[str, str]]]
+    context: List[str]
     judgements: List[Dict[str, Any]]
     query_variants: List[str]
     attempts: int
@@ -287,19 +308,22 @@ class RAGState(TypedDict):
 
 def initial_rag(state: RAGState):
     """Node 1: Thực hiện RAG lần đầu và tạo câu trả lời nháp."""
-    draft, cits = rag_answer(state["question"])
+    draft, cits, context = rag_answer(state["question"])
     return {
         "draft_answers": state.get("draft_answers", []) + [draft],
         "citations": state.get("citations", []) + [cits],
-        "attempts": 1, # KHỞI TẠO BỘ ĐẾM
+        "context": state.get("context", []) + [context],
+        "attempts": 1, 
     }
 
 def judge(state: RAGState):
     """Node 2: Đánh giá chất lượng của câu trả lời nháp cuối cùng."""
+    # --- ĐÃ SỬA: Thêm tham số context vào hàm llm_judge ---
     verdict = llm_judge(
         state["question"],
         state["draft_answers"][-1],
         state["citations"][-1],
+        state["context"][-1] 
     )
     return {"judgements": state.get("judgements", []) + [verdict]}
 
@@ -318,11 +342,12 @@ def rewrite_query(state: RAGState):
 def reretrieve_and_answer(state: RAGState):
     """Node 4: Truy xuất lại tài liệu với truy vấn mới và trả lời lần 2."""
     # Sử dụng `stronger=True` (k=8) cho lần truy xuất thứ hai
-    draft, cits = rag_answer(state["question"], stronger=True)
+    draft, cits, context = rag_answer(state["question"], stronger=True)
     return {
         "draft_answers": state["draft_answers"] + [draft],
         "citations": state["citations"] + [cits],
-        "attempts": state["attempts"] + 1, # TĂNG BỘ ĐẾM
+        "context": state["context"] + [context],
+        "attempts": state["attempts"] + 1,
     }
 
 def finalize(state: RAGState):
@@ -419,9 +444,10 @@ if __name__ == "__main__":
         "question": user_question,
         "draft_answers": [],
         "citations": [],
+        "context": [], # Đã khởi tạo danh sách rỗng để tránh KeyError
         "judgements": [],
         "query_variants": [],
-        "attempts": 0, # Khởi tạo là 0
+        "attempts": 0,
     }
 
     # Cấu hình thread ID để sử dụng MemorySaver
@@ -432,7 +458,6 @@ if __name__ == "__main__":
     
     last_msg = final["messages"][-1]
     
-    # Kiểm tra xem nó là Object hay Dict để xử lý phù hợp
     if hasattr(last_msg, "content"):
         print(last_msg.content)
     else:
