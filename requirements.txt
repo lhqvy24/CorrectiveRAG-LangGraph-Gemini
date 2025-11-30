@@ -8,3 +8,4 @@ chromadb
 python-dotenv
 langchain-huggingface
 langchain_chroma
+beautifulsoup4
