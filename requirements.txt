@@ -1,0 +1,10 @@
+langchain>=0.3
+langchain-community
+langgraph
+langchain-google-genai
+google-generativeai
+sentence-transformers
+chromadb
+python-dotenv
+langchain-huggingface
+langchain_chroma
