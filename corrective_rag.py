@@ -1,7 +1,11 @@
 import os
 import json
+import requests
+import operator
+from operator import add
 from pathlib import Path
 from typing import List, Dict, Any, Literal
+from markdownify import markdownify as md_converter
 
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -31,80 +35,105 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found. Please set it in .env")
 
 # Initialize Global LLM and Embedder
-def get_llm(model: str = "gemini-2.5-flash") -> ChatGoogleGenerativeAI:
+def get_llm(model: str = "models/gemma-3-12b-it") -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
         model=model,
         google_api_key=GEMINI_API_KEY,
-        temperature=0.2,
+        temperature=0,
     )
 
 LLM = get_llm()
 EMBEDDER = HuggingFaceEmbeddings(
     model_name="maidalun1020/bce-embedding-base_v1",
-    model_kwargs={'device': 'cpu'}, # Or 'cuda' / 'mps' if there is a GPU
-    encode_kwargs={'normalize_embeddings': True} # BCE suggests normalize
+    model_kwargs={'device': 'cpu'}, 
+    encode_kwargs={'normalize_embeddings': True} 
 )
-MAX_ATTEMPTS = 2 # Limit retry time (1 initial + 1 retry)
+MAX_ATTEMPTS = 2 
 
-
-# ========== 1. DOCS → VECTOR STORE (HTML SUPPORTED) ==========
-
+# --- PATH CONSTANTS ---
 DOCS_DIR = Path("docs/langgraph")
 VS_DIR = "vectorstore/langgraph"
 
-# Official URLs to attach as metadata
-URL_MAP = {
-    "overview": "https://docs.langchain.com/oss/python/langgraph/overview",
-    "graph-api": "https://docs.langchain.com/oss/python/langgraph/graph-api",
-    "workflows-agents": "https://docs.langchain.com/oss/python/langgraph/workflows-agents",
-    "retrieval": "https://docs.langchain.com/oss/python/langchain/retrieval",
-    "rag": "https://docs.langchain.com/oss/python/langchain/rag",
-    "agents": "https://docs.langchain.com/oss/python/langchain/agents",
+# --- URLs TO DOWNLOAD ---
+# I have updated the 'overview' URL to the correct current path
+URLS_TO_DOWNLOAD = {
+    "overview": "https://langchain-ai.github.io/langgraph/concepts/high_level/", 
+    "graph-api": "https://langchain-ai.github.io/langgraph/concepts/low_level/", 
+    "workflows-agents": "https://langchain-ai.github.io/langgraph/concepts/agentic_concepts/", 
+    "retrieval": "https://python.langchain.com/docs/concepts/retrieval/", 
+    "rag": "https://python.langchain.com/docs/tutorials/rag/",
+    "agents": "https://python.langchain.com/docs/concepts/agents/",
 }
 
-def load_docs() -> List[Document]:
-    """Load docs (.html/.htm/.md/.txt), convert HTML → text, split, add metadata."""
+
+# ========== 1. DOWNLOADER & DOCS LOADING ==========
+
+def download_sources_as_md():
+    """Downloads the 6 required pages and saves them as .md files."""
     if not DOCS_DIR.exists():
-        raise FileNotFoundError("docs/langgraph/ not found. Please put your docs there.")
+        DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"Created directory: {DOCS_DIR}")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200) # Overlap rate about 10-25% is good
-    docs: List[Document] = []
+    print("⬇️  Starting download of sources...")
 
-    for f in DOCS_DIR.glob("*"):
-
-        if f.suffix.lower() not in [".html", ".htm", ".md", ".txt"]:
+    for filename, url in URLS_TO_DOWNLOAD.items():
+        file_path = DOCS_DIR / f"{filename}.md"
+        
+        # Skip if already exists
+        if file_path.exists():
+            print(f"   - Skipping {filename}.md (already exists)")
             continue
 
-        raw = f.read_text(encoding="utf-8", errors="ignore")
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            
+            # Parse HTML
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            # EXTRACT CONTENT: Try to find the main article content
+            content_html = soup.find("article") or soup.find("main") or soup.body
+            
+            if content_html:
+                # Convert to Markdown
+                markdown_text = md_converter(str(content_html), heading_style="ATX")
+                # Clean up empty lines
+                markdown_text = "\n".join([line for line in markdown_text.splitlines() if line.strip()])
+                
+                file_path.write_text(markdown_text, encoding="utf-8")
+                print(f"   ✅ Downloaded & Converted: {filename}.md")
+            else:
+                print(f"   ⚠️ Could not find main content for {url}")
 
-        if f.suffix.lower() in [".html", ".htm"]:
-            soup = BeautifulSoup(raw, "html.parser")
-            # Only keep text in body tag to ignore header/footer that's not relevant
-            text = soup.body.get_text(separator="\n") if soup.body else soup.get_text(separator="\n")
-        else:
-            text = raw
+        except Exception as e:
+            print(f"   ❌ Error downloading {url}: {e}")
+
+    print("🏁 Download complete.\n")
+
+
+def load_docs() -> List[Document]:
+    """Load .md files from docs/langgraph/ and add metadata."""
+    if not DOCS_DIR.exists():
+        download_sources_as_md()
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs: List[Document] = []
+
+    for f in DOCS_DIR.glob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        
+        # Get URL from map
+        source_url = URLS_TO_DOWNLOAD.get(f.stem, "unknown_source")
+        
+        # Simple Title Extraction
+        section_title = f.stem.replace("-", " ").title()
+        for line in text.splitlines():
+            if line.startswith("# "):
+                section_title = line.strip("# ").strip()
+                break
 
         chunks = splitter.split_text(text)
         
-        # --- Metadata Extraction Logic ---
-        section_title = f.stem # Default to filename first
-        
-        # Try to extract real title from HTML
-        if f.suffix.lower() in [".html", ".htm"]:
-            soup = BeautifulSoup(raw, "html.parser")
-            if soup.title and soup.title.string:
-                section_title = soup.title.string.strip()
-            elif soup.find("h1"):
-                section_title = soup.find("h1").get_text().strip()
-        else:
-            # For text/md files, try first line
-            if text.splitlines():
-                possible_title = text.splitlines()[0].strip().lstrip("# ").strip()
-                if possible_title:
-                    section_title = possible_title
-
-        source_url = URL_MAP.get(f.stem, f.name)
-
         for chunk in chunks:
             docs.append(
                 Document(
@@ -124,12 +153,15 @@ def build_vectorstore():
     docs = load_docs()
     print(f"Loaded {len(docs)} chunks from docs/langgraph/")
 
-    Chroma.from_documents(
-        docs,
-        embedding=EMBEDDER,
-        persist_directory=VS_DIR,
-    )
-    print(f"Vector store built at {VS_DIR}")
+    if docs:
+        Chroma.from_documents(
+            docs,
+            embedding=EMBEDDER,
+            persist_directory=VS_DIR,
+        )
+        print(f"Vector store built at {VS_DIR}")
+    else:
+        print("Warning: No documents loaded. Vector store not built.")
 
 
 def get_retriever(stronger: bool = False):
@@ -139,7 +171,6 @@ def get_retriever(stronger: bool = False):
         embedding_function=EMBEDDER
     )
     k = 4 if not stronger else 8
-    # Setting search tool with k chunks
     return vs.as_retriever(search_kwargs={"k": k})
 
 
@@ -163,11 +194,9 @@ def format_docs(docs: List[Document]) -> str:
     return "\n\n".join(f"[{i+1}] {d.page_content}" for i, d in enumerate(docs))
 
 def extract_citations(docs: List[Document]) -> List[Dict[str, str]]:
-    # Filter unique citations based on source_url
     unique_cits = {}
     for d in docs:
         url = d.metadata.get("source_url", "unknown")
-        # Use URL as key to ensure only take one for each source
         unique_cits[url] = {
             "source_url": url,
             "section_title": d.metadata.get("section_title", "unknown"),
@@ -176,10 +205,12 @@ def extract_citations(docs: List[Document]) -> List[Dict[str, str]]:
 
 
 def rag_answer(question: str, stronger: bool = False):
-    # Use initialized LLM and Retriever
     retriever = get_retriever(stronger)
-
     docs = retriever.invoke(question)
+    
+    if not docs:
+        return "I could not find any relevant documents.", [], ""
+
     context = format_docs(docs)
     prompt = RAG_PROMPT.format(context=context, question=question)
     resp = LLM.invoke(prompt)
@@ -191,43 +222,39 @@ def rag_answer(question: str, stronger: bool = False):
 
 
 def llm_judge(question: str, answer: str, citations: List[Dict[str, str]], context: str):
-    # Use initialized LLM  
-    # Request stronger JSON syntax
     judge_prompt = f"""
-You are a strict judge for a Corrective RAG system.
+You are a strict judge for a RAG system performing a "Relevance Check".
 
-Given:
-- User question
-- Draft answer
-- Citations (Sources used for the answer)
+User Question: {question}
+Draft Answer: {answer}
+Context provided: {context[:2000]}...
 
-Judge the answer on its sufficiency, grounding, and relevance.
-Your response MUST be a single, valid JSON object with the following schema:
-{{"pass": boolean, "reasons": string, "score": integer}}
+EVALUATION RULES:
+1. DOES THE ANSWER ADDRESS THE QUESTION?
+   - If the answer is helpful and extracted from context -> PASS = TRUE.
+   - If the answer says "I don't know", "The context does not contain information", "I cannot answer", or similar -> PASS = FALSE.
+   - If the answer is irrelevant or creates information not in context -> PASS = FALSE.
 
-RULES FOR JUDGING:
-1. If the answer is complete, accurate, and grounded in the citations -> PASS = TRUE.
-2. If the answer says "I don't know", "I am not sure", or "The context does not contain info" -> PASS = FALSE (Score: 1). We want the system to retry searching.
-3. If the answer is irrelevant or hallucinates -> PASS = FALSE.
+2. SCORING:
+   - Pass = True -> Score 5
+   - Pass = False -> Score 1
 
-Question:
-{question}
+Output MUST be a valid JSON object: {{"pass": boolean, "reasons": string, "score": integer}}
 
-Draft answer:
-{answer}
+Example 1 (Failure case):
+Answer: "The provided text does not mention MemorySaver."
+JSON: {{"pass": false, "reasons": "Model failed to find answer in context.", "score": 1}}
 
-Source Context used for answer:
-{context}
+Example 2 (Success case):
+Answer: "MemorySaver is used for persistence."
+JSON: {{"pass": true, "reasons": "Answer correctly addresses the question.", "score": 5}}
 
-Citations:
-{json.dumps(citations, indent=2)}
-
-Return ONLY JSON. Do not add any conversational text.
+Return ONLY JSON.
 """
     resp = LLM.invoke(judge_prompt)
     raw = resp.content.strip()
 
-    # Cải tiến: Xử lý lỗi JSON parsing
+    # Xử lý format JSON từ LLM
     if raw.startswith("```json"):
         raw = raw.strip("`").strip("json").strip()
     elif raw.startswith("```"):
@@ -236,51 +263,55 @@ Return ONLY JSON. Do not add any conversational text.
     try:
         verdict = json.loads(raw)
     except Exception as e:
-        print(f"ERROR: Could not parse judge JSON. Fallback to FAIL. Error: {e}")
-        verdict = {"pass": False, "reasons": f"Failed to parse judge output: {raw[:50]}...", "score": 1}
+        print(f"ERROR parsing judge JSON: {e}")
+        # If parse error -> Treat as FAIL
+        verdict = {"pass": False, "reasons": "JSON parse error", "score": 1}
 
-    verdict.setdefault("pass", False)
-    verdict.setdefault("reasons", "No reasons provided.")
-    verdict.setdefault("score", 2)
     return verdict
 
 
 def llm_rewrite(original_question: str, reasons: str) -> str:
-    # Sử dụng LLM đã khởi tạo
+    # Prompt instructs LLM "Abstraction" instead of Rephrase the question
     rewrite_prompt = f"""
-Rewrite this question to be clearer and specifically address the missing information or error.
-Focus on creating a better search query to retrieve relevant documents.
+You are a Corrective RAG Query Optimizer.
+
+Your job is to rewrite the question so that:
+- It becomes answerable using the available documentation.
+- It maps the user's intent to the closest conceptual topic present in the documents.
+- It stays faithful to the *meaning category* of the user question, but expressed in a more general and document-aligned way.
+- It avoids hallucinated terms not present in the documentation.
+- It should maximize retrieval quality by targeting a related concept that *does exist* in the docs.
+
+Steps to follow:
+1. Identify the core concept the user is asking about (e.g. persistence, node execution, message handling, retrieval logic, agent workflow).
+2. Find the closest available concept in the documentation that could meaningfully address this.
+3. Rewrite the question so that it:
+   - aligns with the available concept,
+   - stays truthful to the user’s intention at conceptual level,
+   - increases likelihood of retrieving relevant text chunks.
 
 Original question:
 {original_question}
 
-The answer failed because of these issues:
+Reason the previous answer failed:
 {reasons}
 
-Return ONLY the single, rewritten question text.
+Return ONLY the rewritten question, no explanations.
 """
     resp = LLM.invoke(rewrite_prompt)
     return resp.content.strip()
 
 
-def format_final_answer(
-    final_answer: str,
-    final_citations: List[Dict[str, str]],
-    judgements: List[Dict[str, Any]],
-    query_variants: List[str],
-) -> str:
-
-    lines = []
-    lines.append("### ✅ Final Answer\n")
-    lines.append(final_answer.strip())
-
+def format_final_answer(final_answer, final_citations, judgements, query_variants):
+    lines = ["### ✅ Final Answer\n", final_answer.strip()]
+    
     lines.append("\n\n---\n### 📚 Citations\n")
     for i, c in enumerate(final_citations, 1):
         lines.append(f"{i}. **{c.get('section_title')}** – {c.get('source_url')}")
 
     lines.append("\n---\n### 📝 Decision Log\n")
     for i, j in enumerate(judgements, 1):
-        lines.append(f"- **Attempt {i}**: {'PASS' if j['pass'] else 'FAIL'} (Score: {j['score']}/5) – {j['reasons']}")
+        lines.append(f"- **Attempt {i}**: {'PASS' if j.get('pass') else 'FAIL'} – {j.get('reasons')}")
 
     if query_variants:
         lines.append("\n### 🔄 Rewritten Questions")
@@ -290,58 +321,46 @@ def format_final_answer(
     return "\n".join(lines)
 
 
-# ========== 3. STATE CLASS ==========
+# ========== 3. STATE & NODES ==========
 
 class RAGState(TypedDict):
-    # Tự định nghĩa messages thay vì dùng MessagesState
-    messages: Annotated[List[Any], add_messages] 
+    messages: Annotated[List[Any], add_messages]
     question: str
-    draft_answers: List[str]
-    citations: List[List[Dict[str, str]]]
-    context: List[str]
-    judgements: List[Dict[str, Any]]
-    query_variants: List[str]
+    # Use operator.add, when return it will be appended to the list
+    draft_answers: Annotated[List[str], add] 
+    citations: Annotated[List[List[Dict[str, str]]], add]
+    context: Annotated[List[str], add]
+    judgements: Annotated[List[Dict[str, Any]], add]
+    query_variants: Annotated[List[str], add]
     attempts: int
 
-
-# ========== 4. NODES ==========
-
 def initial_rag(state: RAGState):
-    """Node 1: Thực hiện RAG lần đầu và tạo câu trả lời nháp."""
     draft, cits, context = rag_answer(state["question"])
     return {
-        "draft_answers": state.get("draft_answers", []) + [draft],
-        "citations": state.get("citations", []) + [cits],
-        "context": state.get("context", []) + [context],
+        "draft_answers": [draft],
+        "citations": [cits],
+        "context": [context],
         "attempts": 1, 
     }
 
 def judge(state: RAGState):
-    """Node 2: Đánh giá chất lượng của câu trả lời nháp cuối cùng."""
-    # --- ĐÃ SỬA: Thêm tham số context vào hàm llm_judge ---
     verdict = llm_judge(
         state["question"],
         state["draft_answers"][-1],
         state["citations"][-1],
         state["context"][-1] 
     )
-    return {"judgements": state.get("judgements", []) + [verdict]}
+    return {"judgements": [verdict]}
 
 def rewrite_query(state: RAGState):
-    """Node 3: Viết lại truy vấn dựa trên lý do thất bại."""
-    # Lấy lý do thất bại từ phán quyết cuối cùng
-    reasons = state["judgements"][-1].get("reasons", "Incomplete or irrelevant answer.")
+    reasons = state["judgements"][-1].get("reasons", "Unknown")
     new_q = llm_rewrite(state["question"], reasons)
-    
-    # Cập nhật trạng thái: Đặt câu hỏi mới vào trường question
     return {
         "question": new_q, 
-        "query_variants": state.get("query_variants", []) + [new_q],
+        "query_variants": [new_q],
     }
 
 def reretrieve_and_answer(state: RAGState):
-    """Node 4: Truy xuất lại tài liệu với truy vấn mới và trả lời lần 2."""
-    # Sử dụng `stronger=True` (k=8) cho lần truy xuất thứ hai
     draft, cits, context = rag_answer(state["question"], stronger=True)
     return {
         "draft_answers": state["draft_answers"] + [draft],
@@ -351,116 +370,78 @@ def reretrieve_and_answer(state: RAGState):
     }
 
 def finalize(state: RAGState):
-    """Node 5: Định dạng câu trả lời cuối cùng với trích dẫn và nhật ký."""
     content = format_final_answer(
-        final_answer=state["draft_answers"][-1],
-        final_citations=state["citations"][-1],
-        judgements=state["judgements"],
-        query_variants=state.get("query_variants", []),
+        state["draft_answers"][-1],
+        state["citations"][-1],
+        state["judgements"],
+        state.get("query_variants", []),
     )
-    # Thêm câu trả lời cuối cùng vào lịch sử tin nhắn
     return {
-        "messages": state.get("messages", []) + [{
-            "type": "ai",
-            "content": content,
-        }]
+        "messages": [{"type": "ai", "content": content}]
     }
 
-
-# ========== 5. ROUTER (Conditional Edge) ==========
-
 def route_on_judge(state: RAGState) -> Literal["rewrite", "finalize"]:
-    """Định tuyến luồng dựa trên phán quyết của judge và số lần thử."""
-    
-    # 1. Nếu judge đánh giá PASS, dừng lại
-    if state["judgements"][-1]["pass"]:
-        print("DEBUG: Judge PASS. Finalizing answer.")
+    if state["judgements"][-1].get("pass", False):
         return "finalize"
-    
-    # 2. Nếu đã đạt giới hạn lần thử, dừng lại để tránh vòng lặp vô tận
     if state["attempts"] >= MAX_ATTEMPTS:
-        print(f"DEBUG: Max attempts ({MAX_ATTEMPTS}) reached. Finalizing current answer.")
         return "finalize"
-    
-    # 3. Nếu thất bại và chưa đạt giới hạn, thử lại
-    print("DEBUG: Judge FAIL. Rewriting query and retrying.")
     return "rewrite"
 
 
-# ========== 6. BUILD GRAPH APP ==========
+# ========== 4. APP BUILD & EXECUTION ==========
 
 def build_app():
-    """Xây dựng và biên dịch LangGraph."""
     graph = StateGraph(RAGState)
-
-    # 1. Thêm các Node xử lý
     graph.add_node("initial_rag", initial_rag)
     graph.add_node("judge", judge)
     graph.add_node("rewrite", rewrite_query)
     graph.add_node("reretrieve_and_answer", reretrieve_and_answer)
     graph.add_node("finalize", finalize)
 
-    # 2. Thiết lập Edges (Đường đi cố định)
     graph.add_edge(START, "initial_rag")
     graph.add_edge("initial_rag", "judge")
     graph.add_edge("rewrite", "reretrieve_and_answer")
-    graph.add_edge("reretrieve_and_answer", "judge") # Quay lại judge sau khi thử lại
+    graph.add_edge("reretrieve_and_answer", "judge")
 
-    # 3. Thiết lập Conditional Edge (Đường đi có điều kiện)
-    graph.add_conditional_edges(
-        "judge",
-        route_on_judge,
-        {
-            "rewrite": "rewrite",
-            "finalize": "finalize",
-        }
-    )
-
+    graph.add_conditional_edges("judge", route_on_judge, {"rewrite": "rewrite", "finalize": "finalize"})
     graph.add_edge("finalize", END)
 
-    # Biên dịch đồ thị và thêm Checkpointer (MemorySaver)
     return graph.compile(checkpointer=MemorySaver())
 
-
-# ========== 7. DEMO RUN ==========
-
 if __name__ == "__main__":
+    
+    # 1. Download Sources (Check & Download)
+    download_sources_as_md()
 
-    # Kiểm tra và xây dựng Vector Store nếu chưa tồn tại
+    # 2. Build Vector Store (Check & Build)
     if not Path(VS_DIR).exists():
         print("Vector store not found. Building...")
         build_vectorstore()
     else:
-        print("Vector store exists. Skipping build.")
+        print(f"Vector store exists at {VS_DIR}. Skipping build.")
 
+    # 3. Run App
     app = build_app()
 
     print("\n=== Corrective RAG Demo ===")
-    user_question = input("Enter your question: ")
+    user_q = input("Enter your question: ")
 
-    # Chuẩn bị trạng thái khởi tạo
+    config = RunnableConfig(configurable={"thread_id": "demo-thread"})
+    
+    # Initialize state properly
     init_state = {
-        "messages": [{"type": "human", "content": user_question}],
-        "question": user_question,
+        "messages": [{"type": "human", "content": user_q}],
+        "question": user_q,
         "draft_answers": [],
         "citations": [],
-        "context": [], # Đã khởi tạo danh sách rỗng để tránh KeyError
+        "context": [],
         "judgements": [],
         "query_variants": [],
         "attempts": 0,
     }
 
-    # Cấu hình thread ID để sử dụng MemorySaver
-    config = RunnableConfig(configurable={"thread_id": "demo-thread"})
     final = app.invoke(init_state, config=config)
 
-    print("\n========== FINAL OUTPUT ==========\n")
-    
-    last_msg = final["messages"][-1]
-    
-    if hasattr(last_msg, "content"):
-        print(last_msg.content)
-    else:
-        print(last_msg.get("content"))
-        
-    print("\n=================================\n")
+    print("\n" + "="*40 + "\n")
+    print(final["messages"][-1].content)
+    print("\n" + "="*40 + "\n")
