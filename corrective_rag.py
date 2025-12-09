@@ -55,7 +55,6 @@ DOCS_DIR = Path("docs/langgraph")
 VS_DIR = "vectorstore/langgraph"
 
 # --- URLs TO DOWNLOAD ---
-# I have updated the 'overview' URL to the correct current path
 URLS_TO_DOWNLOAD = {
     "overview": "https://langchain-ai.github.io/langgraph/concepts/high_level/", 
     "graph-api": "https://langchain-ai.github.io/langgraph/concepts/low_level/", 
@@ -174,7 +173,7 @@ def get_retriever(stronger: bool = False):
     return vs.as_retriever(search_kwargs={"k": k})
 
 
-# ========== 2. RAG UTILITIES ==========
+# ========== 2. RAG UTILITIES (PROMPTS & LOGIC) ==========
 
 RAG_PROMPT = PromptTemplate.from_template(
     """You are a helpful assistant answering questions about LangChain and LangGraph.
@@ -222,39 +221,41 @@ def rag_answer(question: str, stronger: bool = False):
 
 
 def llm_judge(question: str, answer: str, citations: List[Dict[str, str]], context: str):
+    """
+    STRICT JUDGE (Relevance Check)
+    """
     judge_prompt = f"""
-You are a strict judge for a RAG system performing a "Relevance Check".
+You are a strict judge for a Corrective RAG system.
+Your task is to perform a "Relevance Check" on the draft answer.
 
 User Question: {question}
 Draft Answer: {answer}
-Context provided: {context[:2000]}...
+Context: {context[:2000]}...
 
 EVALUATION RULES:
-1. DOES THE ANSWER ADDRESS THE QUESTION?
-   - If the answer is helpful and extracted from context -> PASS = TRUE.
-   - If the answer says "I don't know", "The context does not contain information", "I cannot answer", or similar -> PASS = FALSE.
-   - If the answer is irrelevant or creates information not in context -> PASS = FALSE.
+1. USEFULNESS: Does the Draft Answer actually provide the information the user asked for?
+2. REJECTION HANDLING: 
+   - If the answer says "I don't know", "The context does not contain info", "I cannot answer", or similar -> return PASS: FALSE.
+   - We want the system to retry if it fails to find info.
+3. GROUNDEDNESS: If the answer provides information, is it supported by the context?
+   - If supported -> PASS: TRUE.
+   - If hallucinated/wrong -> PASS: FALSE.
 
-2. SCORING:
-   - Pass = True -> Score 5
-   - Pass = False -> Score 1
+Response MUST be a valid JSON object: {{"pass": boolean, "reasons": string}}
 
-Output MUST be a valid JSON object: {{"pass": boolean, "reasons": string, "score": integer}}
-
-Example 1 (Failure case):
-Answer: "The provided text does not mention MemorySaver."
-JSON: {{"pass": false, "reasons": "Model failed to find answer in context.", "score": 1}}
+Example 1 (Failure case - Trigger Rewrite):
+Answer: "I cannot find information about MemorySaver in the provided documents."
+JSON: {{"pass": false, "reasons": "The system failed to retrieve relevant information."}}
 
 Example 2 (Success case):
-Answer: "MemorySaver is used for persistence."
-JSON: {{"pass": true, "reasons": "Answer correctly addresses the question.", "score": 5}}
+Answer: "MemorySaver is used to persist state between graph runs."
+JSON: {{"pass": true, "reasons": "The answer addresses the question using the context."}}
 
 Return ONLY JSON.
 """
     resp = LLM.invoke(judge_prompt)
     raw = resp.content.strip()
 
-    # Xử lý format JSON từ LLM
     if raw.startswith("```json"):
         raw = raw.strip("`").strip("json").strip()
     elif raw.startswith("```"):
@@ -264,39 +265,29 @@ Return ONLY JSON.
         verdict = json.loads(raw)
     except Exception as e:
         print(f"ERROR parsing judge JSON: {e}")
-        # If parse error -> Treat as FAIL
         verdict = {"pass": False, "reasons": "JSON parse error", "score": 1}
 
     return verdict
 
 
 def llm_rewrite(original_question: str, reasons: str) -> str:
-    # Prompt instructs LLM "Abstraction" instead of Rephrase the question
+    """
+    SMART REWRITE (Abstraction Strategy)
+    """
     rewrite_prompt = f"""
-You are a Corrective RAG Query Optimizer.
+You are a Query Optimizer for a RAG system.
+The original query failed to retrieve relevant information.
 
-Your job is to rewrite the question so that:
-- It becomes answerable using the available documentation.
-- It maps the user's intent to the closest conceptual topic present in the documents.
-- It stays faithful to the *meaning category* of the user question, but expressed in a more general and document-aligned way.
-- It avoids hallucinated terms not present in the documentation.
-- It should maximize retrieval quality by targeting a related concept that *does exist* in the docs.
+Your goal: Rewrite the question to improve retrieval chances.
+Strategy:
+1. FOCUS ON CONCEPTS: If a specific name (like "MemorySaver") wasn't found, try asking about the underlying functionality (e.g., "persistence", "checkpointing", "saving state").
+2. SIMPLIFY: Remove unnecessary conversational filler.
+3. BROADEN: Make the query slightly broader to catch related documentation chunks.
 
-Steps to follow:
-1. Identify the core concept the user is asking about (e.g. persistence, node execution, message handling, retrieval logic, agent workflow).
-2. Find the closest available concept in the documentation that could meaningfully address this.
-3. Rewrite the question so that it:
-   - aligns with the available concept,
-   - stays truthful to the user’s intention at conceptual level,
-   - increases likelihood of retrieving relevant text chunks.
+Original Question: {original_question}
+Failure Reason: {reasons}
 
-Original question:
-{original_question}
-
-Reason the previous answer failed:
-{reasons}
-
-Return ONLY the rewritten question, no explanations.
+Return ONLY the rewritten question string. No quotes, no explanations.
 """
     resp = LLM.invoke(rewrite_prompt)
     return resp.content.strip()
@@ -321,12 +312,11 @@ def format_final_answer(final_answer, final_citations, judgements, query_variant
     return "\n".join(lines)
 
 
-# ========== 3. STATE & NODES ==========
+# ========== 3. STATE & NODES (WITH CONSOLE LOGS) ==========
 
 class RAGState(TypedDict):
     messages: Annotated[List[Any], add_messages]
     question: str
-    # Use operator.add, when return it will be appended to the list
     draft_answers: Annotated[List[str], add] 
     citations: Annotated[List[List[Dict[str, str]]], add]
     context: Annotated[List[str], add]
@@ -335,7 +325,9 @@ class RAGState(TypedDict):
     attempts: int
 
 def initial_rag(state: RAGState):
+    print("\n--- Performing Initial RAG Answer ---") # STEP 1
     draft, cits, context = rag_answer(state["question"])
+    print(f"Draft (Preview): {draft[:100]}...") 
     return {
         "draft_answers": [draft],
         "citations": [cits],
@@ -344,23 +336,30 @@ def initial_rag(state: RAGState):
     }
 
 def judge(state: RAGState):
+    print("\n--- Judging Answer Sufficiency ---") # STEP 2
     verdict = llm_judge(
         state["question"],
         state["draft_answers"][-1],
         state["citations"][-1],
         state["context"][-1] 
     )
+    status = "PASS" if verdict.get("pass") else "FAIL"
+    print(f"Judge Verdict: {status} | Reason: {verdict.get('reasons')}")
     return {"judgements": [verdict]}
 
 def rewrite_query(state: RAGState):
+    print("\n--- Rewriting Query & Re-retrieving ---") # STEP 3
     reasons = state["judgements"][-1].get("reasons", "Unknown")
     new_q = llm_rewrite(state["question"], reasons)
+    print(f"Rewritten Query: {new_q}")
     return {
         "question": new_q, 
         "query_variants": [new_q],
     }
 
 def reretrieve_and_answer(state: RAGState):
+    # This falls under Step 3's "re-retrieve information again"
+    print(f"Re-retrieving with stronger search (k=8)...")
     draft, cits, context = rag_answer(state["question"], stronger=True)
     return {
         "draft_answers": state["draft_answers"] + [draft],
@@ -370,6 +369,7 @@ def reretrieve_and_answer(state: RAGState):
     }
 
 def finalize(state: RAGState):
+    print("\n--- Generating Final Answer with Citations ---") # STEP 4
     content = format_final_answer(
         state["draft_answers"][-1],
         state["citations"][-1],
@@ -384,6 +384,7 @@ def route_on_judge(state: RAGState) -> Literal["rewrite", "finalize"]:
     if state["judgements"][-1].get("pass", False):
         return "finalize"
     if state["attempts"] >= MAX_ATTEMPTS:
+        print("Max attempts reached. Proceeding to finalize.")
         return "finalize"
     return "rewrite"
 
@@ -410,10 +411,10 @@ def build_app():
 
 if __name__ == "__main__":
     
-    # 1. Download Sources (Check & Download)
+    # 1. Download Sources
     download_sources_as_md()
 
-    # 2. Build Vector Store (Check & Build)
+    # 2. Build Vector Store
     if not Path(VS_DIR).exists():
         print("Vector store not found. Building...")
         build_vectorstore()
@@ -426,9 +427,8 @@ if __name__ == "__main__":
     print("\n=== Corrective RAG Demo ===")
     user_q = input("Enter your question: ")
 
-    config = RunnableConfig(configurable={"thread_id": "demo-thread"})
+    config = RunnableConfig(configurable={"thread_id": "demo-thread-v2"})
     
-    # Initialize state properly
     init_state = {
         "messages": [{"type": "human", "content": user_q}],
         "question": user_q,
